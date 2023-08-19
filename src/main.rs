@@ -366,6 +366,8 @@ impl Bubblewrap {
             eprintln!("[unpak] WARNING: sandbox escape may be possible because process can control terminal.");
         }
 
+	cmd.arg("--die-with-parent");
+
         cmd.arg(
             self.program
                 .expect("a program to run in the sandbox is required"),

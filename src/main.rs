@@ -6,11 +6,10 @@
 
 use clap::{Parser, Subcommand};
 use serde::{Deserialize, Serialize};
-use std::os::fd::AsRawFd;
+use std::ffi::{OsStr, OsString};
 use std::path::Path;
-use std::{
-    collections::HashMap, ffi::OsString, fs::File, io::ErrorKind, path::PathBuf, process::Command,
-};
+use std::process::{Child, Stdio};
+use std::{io, io::ErrorKind, path::PathBuf, process::Command};
 
 // com.github.osten.unpak
 #[derive(PartialEq, Eq, Hash, Clone, Debug, Serialize, Deserialize)]
@@ -36,6 +35,7 @@ struct SourceProject {
     bdeps: Vec<ProjectId>,
 }
 
+#[allow(dead_code)]
 impl SourceProject {
     pub fn build(&self) {
         println!("[unpak] building project...");
@@ -59,12 +59,13 @@ impl SourceProject {
         }
     }
 }
+const INTERPRETER_HOST: &str = "/lib64/ld-linux-x86-64.so.2";
+const SBX_LD_LINUX: &str = "/usr/lib/ld-linux-x86-64.so.2";
 
-const INTERPRETER: &str = "/lib64/ld-linux-x86-64.so.2";
-
-fn patch_bootstrap(program: &Path) {
+#[allow(dead_code)]
+fn patch_noncompliant(program: &Path) {
     let mut command = Command::new("patchelf");
-    command.args(["--set-interpreter", INTERPRETER]);
+    command.args(["--set-interpreter", SBX_LD_LINUX]);
     command.arg(program);
 
     let mut proc = match command.spawn() {
@@ -87,82 +88,345 @@ fn patch_bootstrap(program: &Path) {
 /* unpak/bdeps */
 /* unpak/rdeps */
 
-enum MountLocation {
+enum StdMountLocation {
     UserExe,
     UserSo,
 }
 
-fn launch_bubblewrap(interpreter: &Path, bdeps: &[(MountLocation, PathBuf)]) {
-    let robinds: Vec<String> = bdeps
-        .iter()
-        .flat_map(|(loc, dep)| {
-            dbg!(dep);
-            // TODO: Do we need to resolve it all the way down, or does bubblewrap do that itself?
-            // in that case, we can just remove the `which` dependency.
-            let canon_path = which::which(dep).unwrap();
-            let mount_path = match loc {
-                MountLocation::UserExe => "/usr/bin",
-                MountLocation::UserSo => "/usr/lib",
-            };
-            [
-                "--ro-bind".to_string(),
-                canon_path.into_os_string().into_string().unwrap(),
-                format!(
-                    "{mount_path}/{}",
-                    dep.file_name()
-                        .unwrap()
-                        .to_os_string()
-                        .into_string()
-                        .unwrap()
-                ),
-            ]
-            .into_iter()
-        })
-        .collect();
+const FHS_EXE: &str = "/usr/bin";
+const FHS_SO: &str = "/usr/lib";
 
-    dbg!(&robinds);
-
-    let mut command = Command::new("bwrap");
-    /* Mount dependencies */
-    command.args(robinds);
-    /* Mount interpreter (avoids "execvp: no such file or directory") */
-    command.args([
-        "--ro-bind",
-        &interpreter.as_os_str().to_string_lossy(),
-        INTERPRETER,
-    ]);
-    /* Set the PATH variable */
-    command.args(["--setenv", "PATH", "/usr/bin"]);
-    /* Change directory to '/' */
-    command.args(["--chdir", "/"]);
-
-    /* special filesystems*/
-    command.args(["--proc", "/proc"]);
-    command.args(["--dev", "/dev"]);
-
-    /* unshare */
-    // --new-session breaks job control with setsid
-    //command.args(["--unshare-pid", "--new-session"]);
-    command.arg("--unshare-pid");
-    
-    /* Set build process */
-    command.arg("/usr/bin/bash");
-
-    let mut proc = match command.spawn() {
-        Ok(proc) => proc,
-        Err(e) => {
-            match e.kind() {
-                ErrorKind::NotFound => {
-                    eprintln!("error: bwrap not found. Is bubblewrap installed?")
-                }
-                _ => eprintln!("error: unknown error: {e:?}"),
-            };
-            return;
+#[allow(dead_code)]
+impl StdMountLocation {
+    fn into_absolute_path(self) -> PathBuf {
+        match self {
+            StdMountLocation::UserExe => FHS_EXE.into(),
+            StdMountLocation::UserSo => FHS_SO.into(),
         }
-    };
+    }
 
-    let exit = proc.wait().unwrap();
-    eprintln!("[unpak] build container exited with code {exit}");
+    fn to_absolute_path(&self) -> PathBuf {
+        match self {
+            StdMountLocation::UserExe => FHS_EXE.into(),
+            StdMountLocation::UserSo => FHS_SO.into(),
+        }
+    }
+}
+
+struct HostPath(pub PathBuf);
+struct SbxPath(pub PathBuf);
+
+impl<T: Into<PathBuf>> From<T> for HostPath {
+    fn from(value: T) -> Self {
+        HostPath(value.into())
+    }
+}
+
+impl<T: Into<PathBuf>> From<T> for SbxPath {
+    fn from(value: T) -> Self {
+        SbxPath(value.into())
+    }
+}
+
+/// Creates a symlink from `dest -> src`
+struct Symlink {
+    /// Where to create the symlink
+    dest: SbxPath,
+    /// Where the symlink points to
+    src: SbxPath,
+}
+
+enum Mount {
+    Touch {
+        sbx_path: SbxPath,
+    },
+    Fs {
+        readonly: bool,
+        host_path: HostPath,
+        sbx_path: SbxPath,
+    },
+}
+
+impl<A: Into<HostPath>, B: Into<SbxPath>> From<(A, B)> for Mount {
+    fn from((host, sbx): (A, B)) -> Self {
+        Mount::Fs {
+            readonly: true,
+            host_path: host.into(),
+            sbx_path: sbx.into(),
+        }
+    }
+}
+
+impl<T: Into<HostPath>> From<(T, StdMountLocation)> for Mount {
+    fn from((host, base_sbx): (T, StdMountLocation)) -> Self {
+        let host_path = host.into();
+        let filename = host_path.0.file_name().unwrap();
+        let sbx_path = base_sbx.into_absolute_path().join(filename).into();
+
+        Mount::Fs {
+            host_path,
+            sbx_path,
+            readonly: true,
+        }
+    }
+}
+
+struct Bubblewrap {
+    mounts: Vec<Mount>,
+    symlinks: Vec<Symlink>,
+    path: Option<OsString>,
+    chdir: Option<PathBuf>,
+    unshare_pid: bool,
+
+    new_session: bool,
+    detach_output: bool,
+
+    program: Option<PathBuf>,
+    envvars: EnvVars,
+}
+
+enum EnvVars {
+    Inherit,
+    Set(Vec<(OsString, OsString)>),
+}
+
+impl EnvVars {
+    fn set_mut(&mut self) -> &mut Vec<(OsString, OsString)> {
+        match self {
+            EnvVars::Inherit => panic!("cannot add new environment variables if `inherit` is set."),
+            EnvVars::Set(list) => list,
+        }
+    }
+}
+
+#[allow(dead_code)]
+impl Bubblewrap {
+    fn new() -> Self {
+        Self {
+            mounts: Vec::new(),
+            symlinks: Vec::new(),
+            path: None,
+            chdir: None,
+            unshare_pid: false,
+            new_session: false,
+            detach_output: false,
+            program: None,
+            envvars: EnvVars::Inherit,
+        }
+    }
+
+    fn add_mount(&mut self, mount: Mount) -> &mut Self {
+        self.mounts.push(mount);
+        self
+    }
+
+    fn with_mount(mut self, mount: Mount) -> Self {
+        self.add_mount(mount);
+        self
+    }
+
+    fn add_mounts(&mut self, mounts: impl IntoIterator<Item = Mount>) {
+        self.mounts.extend(mounts);
+    }
+
+    fn with_mounts(mut self, mounts: impl IntoIterator<Item = Mount>) -> Self {
+        self.add_mounts(mounts);
+        self
+    }
+
+    fn add_symlink(&mut self, symlink: Symlink) -> &mut Self {
+        self.symlinks.push(symlink);
+        self
+    }
+
+    fn with_symlink(mut self, symlink: Symlink) -> Self {
+        self.add_symlink(symlink);
+        self
+    }
+
+    fn add_symlinks(&mut self, symlinks: impl IntoIterator<Item = Symlink>) -> &mut Self {
+        self.symlinks.extend(symlinks);
+        self
+    }
+
+    fn with_symlinks(mut self, symlinks: impl IntoIterator<Item = Symlink>) -> Self {
+        self.add_symlinks(symlinks);
+        self
+    }
+
+    fn set_program(&mut self, program: PathBuf) -> &mut Self {
+        self.program = Some(program);
+        self
+    }
+
+    fn with_program(mut self, program: PathBuf) -> Self {
+        self.set_program(program);
+        self
+    }
+
+    fn with_detach_stdout(mut self, detach_stdout: bool) -> Self {
+        self.detach_output = detach_stdout;
+        self
+    }
+
+    fn with_new_session(mut self, setsid: bool) -> Self {
+        self.new_session = setsid;
+        self
+    }
+
+    fn with_inherit_env(mut self, inherit: bool) -> Self {
+        self.envvars = if inherit {
+            EnvVars::Inherit
+        } else {
+            EnvVars::Set(Vec::new())
+        };
+        self
+    }
+
+    fn add_envvar(&mut self, id: OsString, value: OsString) -> &mut Self {
+        self.envvars.set_mut().push((id, value));
+        self
+    }
+
+    fn with_envvar(mut self, id: OsString, value: OsString) -> Self {
+        self.add_envvar(id, value);
+        self
+    }
+
+    fn spawn(self) -> io::Result<Child> {
+        let mut cmd = Command::new("bwrap");
+        for mount in self.mounts {
+            match mount {
+                Mount::Touch { sbx_path } => {
+                    cmd.args([OsStr::new("--dir"), sbx_path.0.as_os_str()]);
+                }
+                Mount::Fs {
+                    readonly,
+                    host_path,
+                    sbx_path,
+                } => {
+                    let bind_flag: &OsStr = if readonly {
+                        OsStr::new("--ro-bind")
+                    } else {
+                        OsStr::new("--bind")
+                    };
+                    cmd.args([
+                        bind_flag,
+                        host_path.0.as_os_str(),
+                        sbx_path.0.as_os_str(),
+                    ]);
+                }
+            }
+        }
+
+        for symlink in self.symlinks {
+            cmd.args([
+                OsStr::new("--symlink"),
+                symlink.src.0.as_os_str(),
+                symlink.dest.0.as_os_str(),
+            ]);
+        }
+
+        if let Some(path) = self.path {
+            cmd.args([
+                OsStr::new("--set-env"),
+                OsStr::new("PATH"),
+                path.as_os_str(),
+            ]);
+        }
+
+        if let Some(chdir) = self.chdir {
+            cmd.args([OsStr::new("--chdir"), chdir.as_os_str()]);
+        }
+
+        if self.unshare_pid {
+            cmd.arg("--unshare-pid");
+        }
+
+        if self.new_session {
+            eprintln!("[unpak] WARNING: setsid will break job control.");
+            cmd.arg("--new-session");
+        }
+
+        match self.envvars {
+            EnvVars::Inherit => eprintln!("[unpak] WARNING: environment variables are inherited"),
+            EnvVars::Set(list) => {
+                if list.is_empty() {
+                    cmd.arg("--clearenv");
+                } else {
+                    cmd.args(
+                        list.iter()
+                            .flat_map(|(id, value)| [OsStr::new("--setenv"), id, value]),
+                    );
+                }
+            }
+        }
+
+        if !self.new_session && !self.detach_output {
+            eprintln!("[unpak] WARNING: sandbox escape may be possible because process can control terminal.");
+        }
+
+        cmd.arg(
+            self.program
+                .expect("a program to run in the sandbox is required"),
+        );
+
+        if self.detach_output {
+            cmd.stdout(Stdio::null());
+            cmd.stderr(Stdio::null());
+        }
+
+        cmd.spawn()
+    }
+}
+
+fn launch_bubblewrap(proc: &Path, mounts: impl IntoIterator<Item = Mount>) {
+    let mut builder = Bubblewrap::new();
+
+    // essential directories, even if empty.
+    builder.add_mount(Mount::Touch { sbx_path: "/usr/sbin".into() });
+    builder.add_mount(Mount::Touch { sbx_path: "/usr/bin".into() });
+
+    builder.add_mounts(mounts);
+
+    // ld-linux
+    builder.add_mount(Mount::Fs {
+        readonly: true,
+        host_path: INTERPRETER_HOST.into(),
+        sbx_path: SBX_LD_LINUX.into(),
+    });
+
+    builder.add_symlinks([
+        Symlink {
+            src: SBX_LD_LINUX.into(),
+            dest: "/usr/lib64/ld-linux-x86-64.so.2".into(),
+        },
+        Symlink {
+            src: "/usr/lib".into(),
+            dest: "/lib".into(),
+        },
+        Symlink {
+            src: "/usr/lib64".into(),
+            dest: "/lib64".into(),
+        },
+        Symlink {
+            src: "/usr/bin".into(),
+            dest: "/bin".into(),
+        },
+        Symlink {
+            src: "/usr/sbin".into(),
+            dest: "/sbin".into(),
+        },
+    ]);
+
+    let mut proc = builder
+        .with_program(proc.to_path_buf())
+        .with_inherit_env(false)
+        .spawn()
+        .unwrap();
+
+    let exit_code = proc.wait().unwrap();
+    eprintln!("[unpak] sandbox exited with code {exit_code}");
 }
 
 #[derive(Serialize, Deserialize)]
@@ -191,48 +455,44 @@ struct Arguments {
     action: Action,
 }
 
-const PROJ_MINIZ: &str = "com.github.richgel999.miniz";
-
 fn main() {
     // let args = Arguments::parse();
 
-    patch_bootstrap(Path::new("./bash"));
+    //patch_bootstrap(Path::new("./bash"));
     // TODO: Get ELF interpreter for current binary
-    launch_bubblewrap(
-        Path::new(
-            "/nix/store/ayg065nw0xi1zsyi8glfh5pn4sfqd8xg-glibc-2.37-8/lib/ld-linux-x86-64.so.2",
-        ),
-        &[
-	    // libreadline
-            (
-                MountLocation::UserSo,
-                "/nix/store/4f5dbbbh05f87xi8b3lgs653gs5bpb6d-readline-8.2p1/lib/libreadline.so.8"
-                    .into(),
-            ),
-	    // libhistory
-	    (
-		MountLocation::UserSo,
-		"/nix/store/4f5dbbbh05f87xi8b3lgs653gs5bpb6d-readline-8.2p1/lib/libhistory.so.8".into()
-	    ),
-	    // libncursesw
-	    (
-		MountLocation::UserSo,
-		"/nix/store/gmx0dj8kvl7agm6azrbgv9w3k4kp844y-ncurses-6.4/lib/libncursesw.so.6".into(),
-            ),
-	    // libdl
-	    (
-		MountLocation::UserSo,
-		"/nix/store/ayg065nw0xi1zsyi8glfh5pn4sfqd8xg-glibc-2.37-8/lib/libdl.so.2".into()
-	    ),
-	    // libc
-	    (
-		MountLocation::UserSo,
-		"/nix/store/ayg065nw0xi1zsyi8glfh5pn4sfqd8xg-glibc-2.37-8/lib/libc.so.6".into()
-	    ),
-	    // bash
-            (MountLocation::UserExe, "./bash".into()),
-        ],
-    )
+
+    #[rustfmt::skip]
+    let mounts = [
+	// begin shared libraries
+	(   // libtinfo, dependency of bash
+	    PathBuf::from("/usr/lib/x86_64-linux-gnu/libtinfo.so.6"),
+	    StdMountLocation::UserSo,
+	).into(),
+	(   // libc, dependency of bash
+	    PathBuf::from("/usr/lib/x86_64-linux-gnu/libc.so.6"),
+	    StdMountLocation::UserSo,
+	).into(),
+	(   // libselinux, dependency of ls
+	    PathBuf::from("/usr/lib/x86_64-linux-gnu/libselinux.so.1"),
+	    StdMountLocation::UserSo,
+	).into(),
+	(   // libpcre2-8
+	    PathBuf::from("/usr/lib/x86_64-linux-gnu/libpcre2-8.so.0"),
+	    StdMountLocation::UserSo,
+	).into(),
+
+	// begin executables
+	(   // bash
+	    PathBuf::from("/usr/bin/bash"),
+	    StdMountLocation::UserExe,
+	).into(),
+	(   // ls
+	    PathBuf::from("/usr/bin/ls"),
+	    StdMountLocation::UserExe,
+	).into()
+    ];
+
+    launch_bubblewrap(Path::new("/usr/bin/bash"), mounts);
 
     /*match args.action {
         Action::Build {
